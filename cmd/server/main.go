@@ -9,7 +9,10 @@ import (
 	"time"
 
 	"github.com/julienschmidt/httprouter"
-	pshandler "github.com/luqmanahmads/chatapp/internal/handler/pubsub"
+	pshandler "github.com/luqmanahmads/chatapp/internal/handler/http"
+	chatrepo "github.com/luqmanahmads/chatapp/internal/repository/chat"
+	chatuc "github.com/luqmanahmads/chatapp/internal/usecase/chat"
+	"github.com/nsqio/go-nsq"
 )
 
 func main() {
@@ -22,6 +25,7 @@ func main() {
 }
 
 func run() error {
+	// Start HTTP server.
 	s := &http.Server{
 		Handler:      setupHandler(),
 		ReadTimeout:  time.Second * 10,
@@ -35,6 +39,7 @@ func run() error {
 	}()
 	log.Printf("application started at :8008")
 
+	// Shutdown HTTP Server.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt)
 	select {
@@ -51,12 +56,28 @@ func run() error {
 }
 
 func setupHandler() http.Handler {
-	pubsubHandler := pshandler.New()
+	// Init Components.
+	nsqProducer, err := nsq.NewProducer("localhost:4150", nsq.NewConfig())
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// Init Repos.
+	chatRepo := chatrepo.New(nsqProducer)
+
+	// Init Usecases.
+	chatUC := chatuc.New(chatRepo)
+
+	// Init Handlers.
+	pubsubHandler := pshandler.New(chatUC)
 
 	router := httprouter.New()
 	router.GET("/", pubsubHandler.HandleWelcome)
 	router.POST("/publish", pubsubHandler.HandlePublish)
 	router.GET("/subscribe", pubsubHandler.HandleSubscribe)
+
+	router.POST("/v2/publish", pubsubHandler.HandlePublishV2)
+	router.GET("/v2/subscribe", pubsubHandler.HandleSubscribeV2)
 
 	return router
 }

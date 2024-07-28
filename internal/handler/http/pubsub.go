@@ -14,28 +14,35 @@ import (
 	"nhooyr.io/websocket"
 )
 
-type PublishSubscribeHandler struct {
+type chatUsecase interface {
+	SendChat(ctx context.Context, message entity.ChatMessage) error
+	ReadChat(ctx context.Context, message entity.ChatMessage) (chan entity.ChatMessage, error)
+}
+
+type publishSubscribeHandler struct {
 	mutex         sync.RWMutex
 	subscriberMap map[string]subscriber
 	logf          func(f string, v ...interface{})
+	chatUsecase   chatUsecase
 }
 
-func New() *PublishSubscribeHandler {
-	cs := &PublishSubscribeHandler{
+func New(chatUsecase chatUsecase) *publishSubscribeHandler {
+	cs := &publishSubscribeHandler{
 		subscriberMap: map[string]subscriber{},
 		logf:          log.Printf,
+		chatUsecase:   chatUsecase,
 	}
 
 	return cs
 }
 
-func (h *PublishSubscribeHandler) HandleWelcome(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *publishSubscribeHandler) HandleWelcome(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Welcome chatapp!"))
 }
 
-func (h *PublishSubscribeHandler) HandlePublish(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *publishSubscribeHandler) HandlePublish(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.logf("err read all: %s", err.Error())
@@ -75,7 +82,7 @@ func (h *PublishSubscribeHandler) HandlePublish(w http.ResponseWriter, r *http.R
 	w.Write(body)
 }
 
-func (h *PublishSubscribeHandler) HandleSubscribe(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+func (h *publishSubscribeHandler) HandleSubscribe(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	wsconn, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		h.logf("failed websocket accept: %s", err.Error())
@@ -125,14 +132,99 @@ func (h *PublishSubscribeHandler) HandleSubscribe(w http.ResponseWriter, r *http
 	}
 }
 
-func (h *PublishSubscribeHandler) getSubscriber(name string) (subscriber, bool) {
+func (h *publishSubscribeHandler) HandlePublishV2(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.logf("err read all: %s", err.Error())
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	var publishParam entity.PublishParam
+	err = json.Unmarshal(body, &publishParam)
+	if err != nil {
+		h.logf("err unmarshall: %s", err.Error())
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	err = h.chatUsecase.SendChat(r.Context(), entity.ChatMessage(publishParam))
+	if err != nil {
+		h.logf("err publish: %s", err.Error())
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
+}
+
+func (h *publishSubscribeHandler) HandleSubscribeV2(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	wsconn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		h.logf("failed websocket accept: %s", err.Error())
+		wsconn.Close(websocket.StatusProtocolError, "cannot accept")
+		return
+	}
+	defer wsconn.CloseNow()
+
+	typ, msg, err := wsconn.Read(r.Context())
+	if err != nil {
+		h.logf("err wsconn read: %s", err.Error())
+		wsconn.Close(websocket.StatusProtocolError, "cannot read ws message")
+		return
+	}
+
+	if typ != websocket.MessageText {
+		h.logf("invalid message type")
+		wsconn.Close(websocket.StatusPolicyViolation, "invalid message type binary")
+		return
+	}
+
+	var subscribeParam entity.SubscribeParam
+	err = json.Unmarshal(msg, &subscribeParam)
+	if err != nil {
+		h.logf("err unmarshall: %s", err.Error())
+		wsconn.Close(websocket.StatusUnsupportedData, "unmarshall failed")
+		return
+	}
+
+	ctx := wsconn.CloseRead(r.Context())
+
+	readChan, err := h.chatUsecase.ReadChat(ctx, entity.ChatMessage{Receiver: subscribeParam.Subscriber})
+	if err != nil {
+		h.logf("err read chat: %s", err.Error())
+		wsconn.Close(websocket.StatusInternalError, "read chat failed")
+		return
+	}
+
+	for {
+		select {
+		case msg := <-readChan:
+			bytes, err := json.Marshal(msg)
+			if err != nil {
+				return
+			}
+
+			err = writeWithTimeout(ctx, wsconn, bytes)
+			if err != nil {
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (h *publishSubscribeHandler) getSubscriber(name string) (subscriber, bool) {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
 	subscriber, ok := h.subscriberMap[name]
 	return subscriber, ok
 }
 
-func (h *PublishSubscribeHandler) addSubscriber(name string) subscriber {
+func (h *publishSubscribeHandler) addSubscriber(name string) subscriber {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
@@ -145,7 +237,7 @@ func (h *PublishSubscribeHandler) addSubscriber(name string) subscriber {
 	return subscriber
 }
 
-func (h *PublishSubscribeHandler) deleteSubscriber(name string) {
+func (h *publishSubscribeHandler) deleteSubscriber(name string) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
